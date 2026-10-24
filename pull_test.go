@@ -100,8 +100,8 @@ func TestExtractRootfsConfinedLinksAndPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	copy, err := os.Stat(filepath.Join(directory, "copy"))
-	if err != nil || !os.SameFile(original, copy) {
+	hardLinkInfo, err := os.Stat(filepath.Join(directory, "copy"))
+	if err != nil || !os.SameFile(original, hardLinkInfo) {
 		t.Fatalf("regular-file hard link was not preserved: %v", err)
 	}
 	content, err := os.ReadFile(filepath.Join(directory, "bin/sh"))

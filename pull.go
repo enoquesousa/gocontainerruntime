@@ -291,9 +291,9 @@ func (e *archiveExtractor) extractEntry(reader io.Reader, header *tar.Header) er
 	case tar.TypeReg:
 		return e.regularFile(reader, name, header.Size, mode)
 	case tar.TypeSymlink, tar.TypeLink:
-		copy := *header
-		copy.Name = name
-		e.links = append(e.links, &copy)
+		copiedHeader := *header
+		copiedHeader.Name = name
+		e.links = append(e.links, &copiedHeader)
 		return nil
 	default:
 		return errors.New("unsupported archive entry type")
