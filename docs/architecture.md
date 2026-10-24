@@ -2,6 +2,27 @@
 
 This document explains the technical implementation of `gocontainerruntime`.
 
+The process runs privileged and assumes trusted root filesystems and commands.
+The mechanisms below demonstrate container construction; they do not provide a
+security sandbox for hostile workloads. See [SECURITY.md](../SECURITY.md).
+
+## Configuration and process handoff
+
+Cobra parses runtime options before positional arguments. `run --env NAME` reads
+only the selected name from the parent's environment; values are not CLI flags.
+The parent constructs a minimal environment for its re-exec and passes selected
+values through an internal pipe. The workload receives the explicit environment
+after the child performs filesystem setup. Its argv is forwarded exactly once.
+The first executable is resolved against the runtime's fixed `PATH` inside the
+rootfs, before explicit variables are passed to `exec`. The handoff is released
+only after the parent finishes network setup and attaches the child to cgroups.
+
+The default environment is independent of the parent's `PATH`, home directory,
+locale, credentials, proxy settings and agent sockets. See the
+[credential flow](../SECURITY.md#credential-flow) for import and rotation limits.
+Host `ip`/`nsenter` lookup still uses the operator's trusted `PATH`; this is
+separate from the fixed environment passed to those helpers and to the child.
+
 ## Process Isolation: Namespaces
 
 The core of container isolation relies on Linux Namespaces. When the parent process starts, it uses the `CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWPID`, and `CLONE_NEWNET` flags via `syscall.SysProcAttr`.
@@ -27,7 +48,9 @@ The child process PID is written to `cgroup.procs` in both directories to start 
 
 ## Filesystem Isolation: Chroot
 
-The runtime pulls an Alpine Linux minirootfs. The isolation is achieved in three steps:
+The runtime verifies the pinned Alpine minirootfs checksum before extracting it
+through a path-confined filesystem root. Temporary extraction is published only
+after it succeeds. The runtime then changes the workload's filesystem view:
 1. `syscall.Chroot(rootfs)`: Changes the root directory context to the extracted Alpine folder.
 2. `os.Chdir("/")`: Moves the current working directory to the new root.
 3. `syscall.Mount("proc", "/proc", "proc", 0, "")`: Mounts the special `/proc` filesystem so that tools like `ps` and `top` work correctly within the container.

@@ -1,6 +1,6 @@
 // Package main implements a minimal container runtime using Linux namespaces and cgroups.
 //
-// Implementation Details
+// # Implementation Details
 //
 // The runtime uses several Linux isolation features:
 //
@@ -16,7 +16,7 @@
 // 4. Networking:
 // Sets up a veth pair to connect the container to the host network namespace.
 //
-// Architecture
+// # Architecture
 //
 // The execution follows a two-stage process:
 //   - [run]: The first stage sets up namespaces and cgroups, then re-executes itself.

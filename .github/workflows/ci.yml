@@ -2,23 +2,62 @@ name: CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   pull_request:
-    branches: [ main, master ]
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.25.x'
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
 
-    - name: Build
-      run: go build -v -o gocontainer main.go
+      - name: Verify dependencies
+        run: go mod verify
 
-    - name: Test
-      run: go test -v ./...
+      - name: Check Go formatting
+        run: |
+          unformatted_files="$(gofmt -l .)"
+          if [ -n "$unformatted_files" ]; then
+            printf '%s\n' "$unformatted_files"
+            exit 1
+          fi
+
+      - name: Staticcheck
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.12.1
+          args: --no-config --default=none --enable=staticcheck --timeout=3m
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build Linux runtime
+        run: go build -v -o gocontainer .
+
+      - name: Test without privileged integration
+        run: env -u GOCONTAINER_PRIVILEGED_TESTS -u GOCONTAINER_TEST_ROOTFS go test -race -timeout=90s -v ./...
+
+      - name: Build Windows stub
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -v -o gocontainer.exe .
+
+      - name: Scan for reachable dependency vulnerabilities
+        run: |
+          runtime_go_version="$(go env GOVERSION)"
+          GOVERSION="$runtime_go_version" go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -scan=symbol ./...

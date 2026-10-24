@@ -1,6 +1,6 @@
 # Project Variables
 BINARY_NAME=gocontainer
-GO_VERSION=1.25.0
+GO_VERSION=1.26.10
 DOCKER_IMAGE=alpine:latest
 ROOTFS_DIR=./cache/alpine_rootfs
 
@@ -19,7 +19,7 @@ all: build
 
 build:
 	@echo "Building $(BINARY_NAME)..."
-	@$(GOBUILD) -o $(BINARY_NAME) main.go
+	@$(GOBUILD) -o $(BINARY_NAME) .
 
 clean:
 	@echo "Cleaning up..."
