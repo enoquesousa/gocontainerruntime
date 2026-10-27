@@ -10,11 +10,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -22,11 +24,12 @@ import (
 )
 
 type tarEntry struct {
-	name string
-	kind byte
-	link string
-	mode int64
-	data string
+	name     string
+	kind     byte
+	link     string
+	mode     int64
+	data     string
+	zeroMode bool
 }
 
 func syntheticArchive(t *testing.T, entries ...tarEntry) []byte {
@@ -38,7 +41,7 @@ func syntheticArchive(t *testing.T, entries ...tarEntry) []byte {
 		if entry.kind == 0 {
 			entry.kind = tar.TypeReg
 		}
-		if entry.mode == 0 {
+		if entry.mode == 0 && !entry.zeroMode {
 			entry.mode = 0755
 		}
 		header := &tar.Header{Name: entry.name, Typeflag: entry.kind, Mode: entry.mode, Linkname: entry.link}
@@ -243,6 +246,70 @@ func TestExtractRootfsLimitsAndCorruption(t *testing.T) {
 	}
 }
 
+func TestExtractRootfsBoundsLogicalSparseFileBytes(t *testing.T) {
+	const fileSize = 8 << 10
+	limits := extractionLimits{bytes: 2 * fileSize, file: fileSize, entries: 10}
+	for _, count := range []int{2, 3} {
+		t.Run(fmt.Sprintf("%d_files", count), func(t *testing.T) {
+			data := sparseArchive(t, count, fileSize)
+			directory, err := extractFixture(t, data, limits)
+			if count == 2 && err != nil {
+				t.Fatalf("logical file bytes exactly at the limit must be accepted: %v", err)
+			}
+			if count == 3 && err == nil {
+				t.Fatal("sparse files exceeded the cumulative logical extraction limit")
+			}
+			for index := range 2 {
+				content, err := os.ReadFile(filepath.Join(directory, fmt.Sprintf("sparse-%d", index)))
+				if err != nil || len(content) != fileSize || content[0] != 'x' || !bytes.Equal(content[1:], make([]byte, fileSize-1)) {
+					t.Fatalf("valid sparse entry was not expanded correctly: %v", err)
+				}
+			}
+			if _, err := os.Lstat(filepath.Join(directory, "sparse-2")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("the file exceeding the logical byte budget must not be created")
+			}
+		})
+	}
+}
+
+func sparseArchive(t *testing.T, count int, logicalSize int64) []byte {
+	t.Helper()
+	var raw bytes.Buffer
+	archive := tar.NewWriter(&raw)
+	for index := range count {
+		header := &tar.Header{
+			Name: fmt.Sprintf("sparse-%d", index), Typeflag: tar.TypeReg, Mode: 0600, Size: 1, Format: tar.FormatPAX,
+			// tar.Writer suppresses GNU sparse records. An equal-length placeholder
+			// lets this fixture encode them without changing PAX record lengths.
+			PAXRecords: map[string]string{
+				"XYZ.sparse.major": "0", "XYZ.sparse.minor": "1", "XYZ.sparse.numblocks": "1",
+				"XYZ.sparse.map": "0,1", "XYZ.sparse.size": strconv.FormatInt(logicalSize, 10),
+			},
+		}
+		if err := archive.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := archive.Write([]byte{'x'}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if int64(raw.Len()) >= 2*logicalSize {
+		t.Fatal("sparse fixture must fit within the raw stream limit")
+	}
+	var output bytes.Buffer
+	compressed := gzip.NewWriter(&output)
+	if _, err := compressed.Write(bytes.ReplaceAll(raw.Bytes(), []byte("XYZ.sparse."), []byte("GNU.sparse."))); err != nil {
+		t.Fatal(err)
+	}
+	if err := compressed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
+}
+
 func archiveDigest(data []byte) string {
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:])
@@ -258,7 +325,11 @@ func trustedPullClient(t *testing.T, server *httptest.Server) *http.Client {
 }
 
 func TestPullRootfsPublishesOnlyAfterVerification(t *testing.T) {
-	data := shellArchive(t)
+	data := syntheticArchive(t,
+		tarEntry{name: ".", kind: tar.TypeDir, mode: 0750},
+		tarEntry{name: "bin/sh", kind: tar.TypeSymlink, link: "/bin/busybox"},
+		tarEntry{name: "bin/busybox", data: "synthetic executable bytes"},
+	)
 	destination := filepath.Join(t.TempDir(), "rootfs")
 	var sawPartial atomic.Bool
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -278,9 +349,111 @@ func TestPullRootfsPublishesOnlyAfterVerification(t *testing.T) {
 	if err != nil || string(contents) != "synthetic executable bytes" {
 		t.Fatalf("complete verified rootfs was not published: %v", err)
 	}
+	info, err := os.Stat(destination)
+	if err != nil || info.Mode().Perm() != 0750 {
+		t.Fatalf("staging cleanup changed published rootfs permissions: %v", err)
+	}
 	entries, err := os.ReadDir(filepath.Dir(destination))
 	if err != nil || len(entries) != 1 || entries[0].Name() != "rootfs" {
 		t.Fatalf("staging directory was not cleaned up: %v", err)
+	}
+}
+
+func TestPullRootfsCleansRestrictiveDirectories(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		entries []tarEntry
+	}{
+		{"root-read-only", []tarEntry{
+			{name: ".", kind: tar.TypeDir, mode: 0400},
+			{name: "retained", data: "small synthetic contents"},
+		}},
+		{"root-no-permissions", []tarEntry{
+			{name: ".", kind: tar.TypeDir, zeroMode: true},
+			{name: "retained", data: "small synthetic contents"},
+		}},
+		{"nested-read-only", []tarEntry{
+			{name: "outer", kind: tar.TypeDir, mode: 0400},
+			{name: "outer/inner", kind: tar.TypeDir, mode: 0400},
+			{name: "outer/inner/retained", data: "small synthetic contents"},
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			parent := t.TempDir()
+			// Restore only known fixture directories if an assertion fails before
+			// staging cleanup, so this regression also cleans up against old code.
+			t.Cleanup(func() {
+				entries, _ := os.ReadDir(parent)
+				for _, entry := range entries {
+					if !entry.IsDir() || !strings.HasPrefix(entry.Name(), ".alpine-pull-") {
+						continue
+					}
+					root, err := os.OpenRoot(filepath.Join(parent, entry.Name()))
+					if err != nil {
+						t.Error(err)
+						continue
+					}
+					for _, name := range []string{"rootfs", "rootfs/outer", "rootfs/outer/inner"} {
+						_ = root.Chmod(name, 0700)
+					}
+					_ = root.Close()
+				}
+			})
+			data := syntheticArchive(t, test.entries...)
+			client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK, Header: make(http.Header),
+					Body: io.NopCloser(bytes.NewReader(data)), ContentLength: int64(len(data)),
+				}, nil
+			})}
+			if err := pullRootfs(t.Context(), filepath.Join(parent, "cache"), "https://fixture.invalid/rootfs", archiveDigest(data), client); err == nil {
+				t.Fatal("fixture without bin/sh must fail validation")
+			}
+			entries, err := os.ReadDir(parent)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("failed pull left staging data: entries=%d, error=%v", len(entries), err)
+			}
+		})
+	}
+}
+
+func TestCleanupPullStageDoesNotFollowSymlinks(t *testing.T) {
+	outside := t.TempDir()
+	marker := filepath.Join(outside, "marker")
+	if err := os.WriteFile(marker, []byte("unchanged"), 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(outside, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(outside, 0700) })
+	stage := filepath.Join(t.TempDir(), "stage")
+	rootfs := filepath.Join(stage, "rootfs")
+	if err := os.MkdirAll(rootfs, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(rootfs, "outside")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(rootfs, 0000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(rootfs, 0700) })
+	if err := cleanupPullStage(stage); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(stage); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("private staging directory was not removed")
+	}
+	for name, mode := range map[string]os.FileMode{outside: 0500, marker: 0400} {
+		info, err := os.Stat(name)
+		if err != nil || info.Mode().Perm() != mode {
+			t.Fatalf("cleanup changed a path outside staging: %v", err)
+		}
+	}
+	content, err := os.ReadFile(marker)
+	if err != nil || string(content) != "unchanged" {
+		t.Fatalf("cleanup changed the external marker: %v", err)
 	}
 }
 

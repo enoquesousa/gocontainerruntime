@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -78,7 +79,7 @@ func requireAbsent(name string) error {
 	return errors.New("rootfs cache already exists; inspect and move it before pulling again")
 }
 
-func pullRootfs(ctx context.Context, destination, imageURL, digest string, client *http.Client) error {
+func pullRootfs(ctx context.Context, destination, imageURL, digest string, client *http.Client) (resultErr error) {
 	if err := requireAbsent(destination); err != nil {
 		return err
 	}
@@ -90,7 +91,7 @@ func pullRootfs(ctx context.Context, destination, imageURL, digest string, clien
 	if err != nil {
 		return err
 	}
-	defer func() { _ = os.RemoveAll(stage) }()
+	defer func() { resultErr = errors.Join(resultErr, cleanupPullStage(stage)) }()
 	archive := filepath.Join(stage, "rootfs.tar.gz")
 	if err := downloadArchive(ctx, client, imageURL, digest, archive, maxDownloadBytes); err != nil {
 		return err
@@ -104,6 +105,33 @@ func pullRootfs(ctx context.Context, destination, imageURL, digest string, clien
 	}
 	if err := os.Rename(rootfs, destination); err != nil {
 		return fmt.Errorf("publish verified rootfs: %w", err)
+	}
+	return nil
+}
+
+func cleanupPullStage(stage string) error {
+	root, openErr := os.OpenRoot(stage)
+	var walkErr, closeErr error
+	if openErr == nil {
+		// Restore directory access before descending. WalkDir does not follow
+		// symlinks, and os.Root confines every permission change to the stage.
+		walkErr = fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return root.Chmod(name, 0700)
+			}
+			return nil
+		})
+		closeErr = root.Close()
+	} else if errors.Is(openErr, os.ErrNotExist) {
+		openErr = nil
+	}
+	// Still attempt removal if restoring permissions or closing the root failed.
+	removeErr := os.RemoveAll(stage)
+	if err := errors.Join(openErr, walkErr, closeErr, removeErr); err != nil {
+		return fmt.Errorf("clean rootfs staging directory: %w", err)
 	}
 	return nil
 }
@@ -192,11 +220,12 @@ func extractArchiveFile(archive, directory string) error {
 }
 
 type archiveExtractor struct {
-	root  *os.Root
-	limit extractionLimits
-	seen  map[string]bool
-	dirs  map[string]os.FileMode
-	links []*tar.Header
+	root      *os.Root
+	limit     extractionLimits
+	fileBytes int64
+	seen      map[string]bool
+	dirs      map[string]os.FileMode
+	links     []*tar.Header
 }
 
 func extractRootfs(source io.Reader, root *os.Root, limits extractionLimits) error {
@@ -304,6 +333,11 @@ func (e *archiveExtractor) regularFile(reader io.Reader, name string, size int64
 	if size < 0 || size > e.limit.file {
 		return errors.New("archive file exceeds extraction limit")
 	}
+	// tar.Reader materializes sparse holes that are absent from the gzip stream.
+	if size > e.limit.bytes-e.fileBytes {
+		return errors.New("logical rootfs files exceed extraction limit")
+	}
+	e.fileBytes += size
 	file, err := e.root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
