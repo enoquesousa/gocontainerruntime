@@ -3,208 +3,277 @@
 package main
 
 import (
-	"archive/tar"
-	"compress/gzip"
+	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"syscall"
 
 	"github.com/spf13/cobra"
 )
 
-var (
-	// cacheDir is the local directory where the rootfs will be extracted.
-	cacheDir = "./cache/alpine_rootfs"
-	// alpineURL is the official Alpine Linux minirootfs download URL.
-	alpineURL = "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-minirootfs-3.19.1-x86_64.tar.gz"
-)
+// cacheDir is the local directory where the rootfs will be extracted.
+var cacheDir = "./cache/alpine_rootfs"
 
 func main() {
-	var rootCmd = &cobra.Command{
-		Use:   "gocontainer",
-		Short: "A minimal container runtime implemented in Go",
-	}
-
-	// pullCmd handles downloading and extracting the rootfs.
-	var pullCmd = &cobra.Command{
-		Use:   "pull",
-		Short: "Download a basic Alpine rootfs for the container",
-		Run: func(cmd *cobra.Command, args []string) {
-			pull()
-		},
-	}
-
-	// runCmd is the main entry point to start a container.
-	var runCmd = &cobra.Command{
-		Use:   "run [rootfs_path] [command] [args...]",
-		Short: "Run a command inside a new container",
-		Args:  cobra.MinimumNArgs(1),
-		Run: func(cmd *cobra.Command, args []string) {
-			var rootfs, userCommand string
-			var userArgs []string
-
-			// If only 1 arg, use cached image and the arg is the command
-			if len(args) == 1 {
-				if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
-					fmt.Println("No rootfs provided and cache is empty. Running 'pull' first...")
-					pull()
-				}
-				rootfs = cacheDir
-				userCommand = args[0]
-				userArgs = args
-			} else {
-				rootfs = args[0]
-				userCommand = args[1]
-				userArgs = args[1:]
-			}
-
-			run(rootfs, userCommand, userArgs)
-		},
-	}
-
-	// childCmd is an internal command used for re-execution in a new namespace.
-	var childCmd = &cobra.Command{
-		Use:    "child",
-		Hidden: true,
-		Run: func(cmd *cobra.Command, args []string) {
-			// args[0] is rootfs, args[1] is command
-			child(args[0], args[1], args[1:])
-		},
-	}
-
-	rootCmd.AddCommand(pullCmd, runCmd, childCmd)
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Printf("Execution Error: %v\n", err)
+	if err := newRootCommand().Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "Execution error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-// pull downloads and extracts the Alpine Linux minirootfs to the cache directory.
-func pull() {
-	fmt.Printf("Downloading Alpine rootfs from %s...\n", alpineURL)
-
-	if err := os.MkdirAll(cacheDir, 0755); err != nil {
-		must(err)
+func newRootCommand() *cobra.Command {
+	rootCmd := &cobra.Command{
+		Use:           "gocontainer",
+		Short:         "An educational container runtime for trusted workloads",
+		SilenceErrors: true,
+		SilenceUsage:  true,
 	}
+	rootCmd.SetFlagErrorFunc(func(_ *cobra.Command, _ error) error {
+		return errors.New("invalid runtime options; use --help and pass only variable names to --env")
+	})
+	pullCmd := &cobra.Command{
+		Use:   "pull",
+		Short: "Download a basic Alpine rootfs for the container",
+		Args:  cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return pull()
+		},
+	}
+	childCmd := &cobra.Command{
+		Use:                "child ROOTFS COMMAND [ARGS...]",
+		Hidden:             true,
+		DisableFlagParsing: true,
+		Args:               cobra.MinimumNArgs(2),
+		RunE: func(_ *cobra.Command, args []string) error {
+			return child(args[0], args[1:])
+		},
+	}
+	rootCmd.AddCommand(pullCmd, newRunCommand(executeRun), childCmd)
+	return rootCmd
+}
 
-	resp, err := http.Get(alpineURL)
-	must(err)
-	defer resp.Body.Close()
+func newRunCommand(execute func(runConfig) error) *cobra.Command {
+	var names []string
+	command := &cobra.Command{
+		Use:   "run [--env NAME] [rootfs_path] command [args...]",
+		Short: "Run a trusted command with a minimal environment",
+		Long: "Pass runtime options before the first positional argument. A single command uses " +
+			"the cached rootfs; to pass command arguments, specify the rootfs first.",
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			config, err := parseRunConfig(args, names, os.LookupEnv)
+			if err != nil {
+				return err
+			}
+			return execute(config)
+		},
+	}
+	command.Flags().StringArrayVar(&names, "env", nil, "Import one named variable from the caller; repeat for multiple names")
+	command.Flags().SetInterspersed(false)
+	return command
+}
 
-	uncompressed, err := gzip.NewReader(resp.Body)
-	must(err)
-
-	tr := tar.NewReader(uncompressed)
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		must(err)
-
-		target := filepath.Join(cacheDir, header.Name)
-		switch header.Typeflag {
-		case tar.TypeDir:
-			os.MkdirAll(target, 0755)
-		case tar.TypeReg:
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
-			must(err)
-			io.Copy(f, tr)
-			f.Close()
+func executeRun(config runConfig) error {
+	if config.useCache {
+		if _, err := os.Stat(config.rootfs); errors.Is(err, os.ErrNotExist) {
+			fmt.Println("No rootfs provided and cache is empty. Running 'pull' first...")
+			if err := pull(); err != nil {
+				return err
+			}
 		}
 	}
-	fmt.Printf("Download and extraction complete. Cache ready at: %s\n", cacheDir)
+	info, err := os.Stat(config.rootfs)
+	if err != nil || !info.IsDir() {
+		return errors.New("rootfs must be an accessible directory")
+	}
+	return run(config)
 }
 
 // run performs the first stage of container creation: setting up Namespaces and Cgroups.
 // It then re-executes itself with the 'child' command inside the new isolation layers.
-func run(rootfs, userCommand string, userArgs []string) {
+func run(config runConfig) error {
 	fmt.Printf("Running Stage 1 (PID: %d)\n", os.Getpid())
+	pipe, err := prepareHandoff(config.environment)
+	if err != nil {
+		return err
+	}
+	defer pipe.close()
+	cleanupCgroups, err := setupCgroups()
+	if err != nil {
+		return err
+	}
+	defer cleanupCgroups()
+	cmd := newChildProcess(config, pipe.reader)
+	if err := cmd.Start(); err != nil {
+		return errors.New("cannot start the namespace child")
+	}
+	closeRuntimeFile(pipe.reader)
+	defer stopChild(cmd)
+	cleanupNetwork, err := setupNetwork(cmd.Process.Pid)
+	if err != nil {
+		return err
+	}
+	defer cleanupNetwork()
+	if err := releaseChild(cmd.Process.Pid, pipe); err != nil {
+		return err
+	}
+	if err := cmd.Wait(); err != nil {
+		return errors.New("container process failed")
+	}
+	return nil
+}
 
+func newChildProcess(config runConfig, handoff *os.File) *exec.Cmd {
 	// Re-execute itself with 'child' as the first argument to run inside the namespace.
-	args := append([]string{"child", rootfs, userCommand}, userArgs...)
+	args := append([]string{"child", config.rootfs}, config.argv...)
 	cmd := exec.Command("/proc/self/exe", args...)
-
-	// Configure namespaces: PID (processes), UTS (hostname), Mount (fs), Network (ip).
+	cmd.Env = baseEnvironment()
+	cmd.ExtraFiles = []*os.File{handoff}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWNET,
 	}
-
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	return cmd
+}
 
-	// Cgroups setup (using v1 paths)
-	cg := "/sys/fs/cgroup"
-	memCg := cg + "/memory/gocontainer"
-	cpuCg := cg + "/cpu/gocontainer"
+func setupCgroups() (func(), error) {
+	dirs := []string{"/sys/fs/cgroup/memory/gocontainer", "/sys/fs/cgroup/cpu/gocontainer"}
+	created := make([]string, 0, len(dirs))
+	cleanup := func() {
+		for _, dir := range created {
+			if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+				fmt.Fprintln(os.Stderr, "Warning: could not remove a runtime cgroup")
+			}
+		}
+	}
+	for _, dir := range dirs {
+		if err := os.Mkdir(dir, 0755); err != nil {
+			cleanup()
+			return nil, errors.New("cannot create exclusive cgroups v1 directories")
+		}
+		created = append(created, dir)
+	}
+	if err := writeCgroupLimits(dirs); err != nil {
+		cleanup()
+		return nil, err
+	}
+	return cleanup, nil
+}
 
-	must(os.MkdirAll(memCg, 0755))
-	must(os.MkdirAll(cpuCg, 0755))
+func writeCgroupLimits(dirs []string) error {
+	if err := os.WriteFile(dirs[0]+"/memory.limit_in_bytes", []byte("104857600"), 0644); err != nil {
+		return errors.New("cannot configure the memory cgroup")
+	}
+	if err := os.WriteFile(dirs[1]+"/cpu.shares", []byte("512"), 0644); err != nil {
+		return errors.New("cannot configure the CPU cgroup")
+	}
+	return nil
+}
 
-	defer func() {
-		os.Remove(memCg)
-		os.Remove(cpuCg)
-	}()
+func setupNetwork(pid int) (func(), error) {
+	if err := hostCommand("ip", "link", "add", "veth-host", "type", "veth", "peer", "name", "veth-child"); err != nil {
+		return nil, err
+	}
+	cleanup := func() {
+		if err := hostCommand("ip", "link", "delete", "veth-host"); err != nil {
+			fmt.Fprintln(os.Stderr, "Warning: could not remove the runtime network link")
+		}
+	}
+	pidString := fmt.Sprintf("%d", pid)
+	commands := [][]string{
+		{"ip", "link", "set", "veth-child", "netns", pidString},
+		{"ip", "addr", "add", "10.0.0.1/24", "dev", "veth-host"},
+		{"ip", "link", "set", "veth-host", "up"},
+		{"nsenter", "-t", pidString, "-n", "ip", "addr", "add", "10.0.0.2/24", "dev", "veth-child"},
+		{"nsenter", "-t", pidString, "-n", "ip", "link", "set", "veth-child", "up"},
+		{"nsenter", "-t", pidString, "-n", "ip", "link", "set", "lo", "up"},
+	}
+	for _, command := range commands {
+		if err := hostCommand(command[0], command[1:]...); err != nil {
+			cleanup()
+			return nil, err
+		}
+	}
+	return cleanup, nil
+}
 
-	// Apply resource limits: 100MB memory and 512 CPU shares.
-	must(os.WriteFile(memCg+"/memory.limit_in_bytes", []byte("104857600"), 0644))
-	must(os.WriteFile(cpuCg+"/cpu.shares", []byte("512"), 0644))
+func hostCommand(name string, args ...string) error {
+	if err := newHostProcess(name, args...).Run(); err != nil {
+		return errors.New("host network setup command failed")
+	}
+	return nil
+}
 
-	must(cmd.Start())
+func newHostProcess(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.Env = baseEnvironment()
+	return cmd
+}
 
-	// Network Setup: creates a veth pair and moves one end into the container's netns.
-	pid := cmd.Process.Pid
-	exec.Command("ip", "link", "add", "veth-host", "type", "veth", "peer", "name", "veth-child").Run()
-	exec.Command("ip", "link", "set", "veth-child", "netns", fmt.Sprintf("%d", pid)).Run()
-	exec.Command("ip", "addr", "add", "10.0.0.1/24", "dev", "veth-host").Run()
-	exec.Command("ip", "link", "set", "veth-host", "up").Run()
+func releaseChild(pid int, pipe *handoffPipe) error {
+	for _, controller := range []string{"memory", "cpu"} {
+		path := "/sys/fs/cgroup/" + controller + "/gocontainer/cgroup.procs"
+		if err := os.WriteFile(path, []byte(fmt.Sprintf("%d", pid)), 0644); err != nil {
+			return errors.New("cannot attach the child to its cgroups")
+		}
+	}
+	// The child waits for EOF before any hostname, chroot, mount or workload operation.
+	return sendHandoff(pipe.writer, pipe.data)
+}
 
-	// Configure networking inside the container using nsenter.
-	nsenter := []string{"nsenter", "-t", fmt.Sprintf("%d", pid), "-n"}
-	exec.Command(nsenter[0], append(nsenter[1:], "ip", "addr", "add", "10.0.0.2/24", "dev", "veth-child")...).Run()
-	exec.Command(nsenter[0], append(nsenter[1:], "ip", "link", "set", "veth-child", "up")...).Run()
-	exec.Command(nsenter[0], append(nsenter[1:], "ip", "link", "set", "lo", "up")...).Run()
-
-	defer exec.Command("ip", "link", "delete", "veth-host").Run()
-
-	// Write PID to Cgroups to start enforcing limits.
-	pidStr := []byte(fmt.Sprintf("%d", pid))
-	must(os.WriteFile(memCg+"/cgroup.procs", pidStr, 0644))
-	must(os.WriteFile(cpuCg+"/cgroup.procs", pidStr, 0644))
-
-	must(cmd.Wait())
+func stopChild(cmd *exec.Cmd) {
+	if cmd.ProcessState != nil {
+		return
+	}
+	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		fmt.Fprintln(os.Stderr, "Warning: could not stop the namespace child")
+	}
+	var exitError *exec.ExitError
+	if err := cmd.Wait(); err != nil && !errors.As(err, &exitError) {
+		fmt.Fprintln(os.Stderr, "Warning: could not reap the namespace child")
+	}
 }
 
 // child performs the second stage of container setup inside the isolated namespaces.
 // It sets the hostname, chroots into the filesystem, and mounts /proc.
-func child(rootfs, userCommand string, userArgs []string) {
-	fmt.Printf("Running Stage 2 (PID: %d in container)\n", os.Getpid())
-
-	must(syscall.Sethostname([]byte("gocontainer")))
-	must(syscall.Chroot(rootfs))
-	must(os.Chdir("/"))
-	must(syscall.Mount("proc", "/proc", "proc", 0, ""))
-
-	// Find the command path inside the isolated rootfs.
-	cmdPath, err := exec.LookPath(userCommand)
-	if err != nil {
-		fmt.Printf("Execution path error: %v\n", err)
-		os.Exit(1)
+func child(rootfs string, argv []string) error {
+	if err := validateCommand(rootfs, argv); err != nil {
+		return err
 	}
-
-	// Replace the current process with the user's command.
-	must(syscall.Exec(cmdPath, userArgs, os.Environ()))
+	environment, err := receiveChildEnvironment()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Running Stage 2 (PID: %d in container)\n", os.Getpid())
+	if err := enterRootFS(rootfs); err != nil {
+		return err
+	}
+	// LookPath uses the stage's fixed PATH, before opt-in values reach the workload.
+	cmdPath, err := exec.LookPath(argv[0])
+	if err != nil {
+		return errors.New("container command was not found or is not executable")
+	}
+	if err := syscall.Exec(cmdPath, argv, environment); err != nil {
+		return errors.New("cannot execute the container command")
+	}
+	return nil
 }
 
-// must is a helper function that checks for errors and terminates the process if one occurs.
-func must(err error) {
-	if err != nil {
-		fmt.Printf("Fatal Runtime Error: %v\n", err)
-		os.Exit(1)
+func enterRootFS(rootfs string) error {
+	if err := syscall.Sethostname([]byte("gocontainer")); err != nil {
+		return errors.New("cannot set the container hostname")
 	}
+	if err := syscall.Chroot(rootfs); err != nil {
+		return errors.New("cannot enter the container rootfs")
+	}
+	if err := os.Chdir("/"); err != nil {
+		return errors.New("cannot enter the container working directory")
+	}
+	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
+		return errors.New("cannot mount the container proc filesystem")
+	}
+	return nil
 }
